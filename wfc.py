@@ -1,226 +1,277 @@
 """
-Grid Def Component
-Defining : Cell Class and Grid and Entropy and Tiles Classes
+Wave Function Collapse on a 2D grid for Rhino / Grasshopper.
+
+Inputs:
+    TR       : list[str]   each parseable to a sockets list [top, right, bottom, left]
+    x_size   : int         grid width
+    y_size   : int         grid height
+    seed     : int|None    (optional) for reproducible output
+    weights  : list|None   (optional) one weight per tile, enables Shannon entropy
+    DEBUG    : bool         (optional) toggles console prints
+
+Outputs:
+    cells       : Rectangle3d per cell
+    entropy     : option-count label per cell
+    dot_centers : center point per cell
+    tile_ids    : collapsed tile id per cell ('_' if not collapsed)
 """
+
 import Rhino.Geometry as rg
 import random
-from collections import deque
+import math
 import ast
+from collections import deque
 
-#tiles rules (TR INPUT)___________________________________________________
-#we have a dictionary of ID(index) and Rules of each tile
-tiles_rules = {}
-#"enumerate" seperates index and every value of a list
-for i, tile_sockets_gh in enumerate(TR):
-    tile_sockets = ast.literal_eval(tile_sockets_gh)
-    tiles_rules[i] = tile_sockets
+# ----------------------------- configuration -----------------------------
+DEBUG = bool(globals().get('DEBUG', False))
 
-#defining Tile Class
-class Tile:
-    def __init__(self, id, sockets, geometry_data = None):
-        self.id = id
-        self.sockets = sockets # [top, right, bottom, left]
-        self.geometry_data = geometry_data # e.g., a Brep, a list of lines, etc.
-    
-    def get_socket(self, direction): #0: top, 1: right, 2: bottom, 3: left
-        return self.sockets[direction]
+# Sockets convention: [top, right, bottom, left]  ->  indices 0,1,2,3
+DIR_INDEX = {'up': 0, 'right': 1, 'down': 2, 'left': 3}
+OPPOSITE  = {'up': 'down', 'down': 'up', 'left': 'right', 'right': 'left'}
+
+# Set True if a shared edge is read in reverse order by the neighbour
+# (directional / non-symmetric sockets). False = symmetric equality.
+DIRECTIONAL_SOCKETS = False
+
+_seed_in = globals().get('seed', None)
+if _seed_in is not None:
+    random.seed(_seed_in)
 
 
-def check_match(socket1, socket2):
-    return socket1 == socket2
+# ------------------------------- classes ----------------------------------
+class Tile(object):
+    def __init__(self, tile_id, sockets, geometry_data=None):
+        self.id = tile_id
+        self.sockets = sockets            # [top, right, bottom, left]
+        self.geometry_data = geometry_data
 
-#defining Cell Class
-class Cell:
-    def __init__(self, x, y):
+    def get_socket(self, direction):
+        return self.sockets[DIR_INDEX[direction]]
+
+
+class Cell(object):
+    def __init__(self, x, y, all_ids):
         self.x = x
         self.y = y
+        self.options = list(all_ids)
         self.collapsed = False
-        #at first every cell has all of options
-        self.options = list(tiles_rules.keys())
 
     def entropy(self):
         if self.collapsed:
             return 0
-        if len(self.options) == 0:
-            return -1   #in case of contradiction
-        return len(self.options)
-
-#initial Setup___________________________________________________
-x_size = x_size  #input
-y_size = y_size  #input
-num_tiles = len(tiles_rules)
-all_tiles = []
-for tile_id, sockets in tiles_rules.items():
-    all_tiles.append(Tile(tile_id, sockets))
-
-#constructing 2D grid___________________________________________________
-grid = []
-for y in range(y_size):
-    row = []
-    for x in range(x_size):
-        row.append(Cell(x, y))
-    grid.append(row)
+        return len(self.options)         # 0 here means contradiction
 
 
-#step 01: first Collapse________________________________________
-def get_min_entropy_cell(grid, x_size, y_size):
-    min_entropy = float('inf')
+# ------------------------- parse tiles from input -------------------------
+tiles_rules = {}
+all_tiles = {}
+for tid, tile_str in enumerate(TR):
+    sockets = ast.literal_eval(tile_str)
+    tiles_rules[tid] = sockets
+    all_tiles[tid] = Tile(tid, sockets)
+
+# weights / entropy mode
+_weights_in = globals().get('weights', None)
+if _weights_in:
+    WEIGHTS = {tid: float(_weights_in[tid]) for tid in tiles_rules}
+else:
+    WEIGHTS = {tid: 1.0 for tid in tiles_rules}
+USE_SHANNON = any(w != 1.0 for w in WEIGHTS.values())
+
+
+# ----------------------- single source of matching ------------------------
+def check_match(socket_a, socket_b):
+    """Edge compatibility. Change here to alter the whole rule system."""
+    if DIRECTIONAL_SOCKETS:
+        return socket_a == socket_b[::-1]
+    return socket_a == socket_b
+
+
+# ------------------------------- entropy ----------------------------------
+def cell_entropy(cell):
+    if cell.collapsed or not cell.options:
+        return 0.0
+    if not USE_SHANNON:
+        return float(len(cell.options))
+    total = sum(WEIGHTS[o] for o in cell.options)
+    return math.log(total) - sum(
+        WEIGHTS[o] * math.log(WEIGHTS[o]) for o in cell.options) / total
+
+
+def lowest_entropy_cell(grid):
+    best_e = None
     candidates = []
     for row in grid:
-        for cell in row:
-            if not cell.collapsed:
-                e = cell.entropy()
-                if e <= 0:      #in case of contradiction
-                    continue
-                if e < min_entropy:
-                    min_entropy = e
-                    candidates = [cell]
-                elif e == min_entropy:
-                    candidates.append(cell)
-    
+        for c in row:
+            if c.collapsed or len(c.options) <= 0:
+                continue
+            e = cell_entropy(c)
+            if best_e is None or e < best_e - 1e-9:
+                best_e, candidates = e, [c]
+            elif abs(e - best_e) <= 1e-9:
+                candidates.append(c)
     return random.choice(candidates) if candidates else None
 
-def collapse(cell):
-    if not cell.options:
-        return False #contradiction 
-    chosen = random.choice(cell.options)
-    cell.options = [chosen]
+
+# ----------------------------- grid helpers -------------------------------
+def build_grid(x_size, y_size):
+    ids = list(tiles_rules.keys())
+    return [[Cell(x, y, ids) for x in range(x_size)] for y in range(y_size)]
+
+
+def is_fully_collapsed(grid):
+    return all(c.collapsed for row in grid for c in row)
+
+
+def snapshot(grid):
+    return [[(c.collapsed, tuple(c.options)) for c in row] for row in grid]
+
+
+def restore(grid, snap):
+    for row, srow in zip(grid, snap):
+        for c, (collapsed, opts) in zip(row, srow):
+            c.collapsed = collapsed
+            c.options = list(opts)
+
+
+def collapse_to(cell, tile_id):
+    cell.options = [tile_id]
     cell.collapsed = True
 
-    return True
+
+def weighted_order(options):
+    """Return options in the order they should be tried."""
+    opts = list(options)
+    if not USE_SHANNON:
+        random.shuffle(opts)
+        return opts
+    result, pool = [], opts
+    while pool:
+        total = sum(WEIGHTS[o] for o in pool)
+        r, acc = random.uniform(0, total), 0.0
+        for i, o in enumerate(pool):
+            acc += WEIGHTS[o]
+            if r <= acc:
+                result.append(pool.pop(i))
+                break
+        else:
+            result.append(pool.pop())
+    return result
 
 
-#Propagate______________________________________________________
-OPPOSITE = {'right': 'left', 'left': 'right', 'up': 'down', 'down': 'up'}
-DIR_INDEX = {'up': 0, 'right': 1, 'down': 2, 'left': 3}
-
+# ------------------------------ propagation -------------------------------
 def get_neighbors(grid, cell, x_size, y_size):
-    neighbors = []
-    x, y = cell.x, cell.y
-    if x > 0:               neighbors.append((grid[y][x-1], 'left'))   # added as a tuple like: (<Cell object>, 'left')
-    if x < x_size - 1:      neighbors.append((grid[y][x+1], 'right'))
-    if y > 0:               neighbors.append((grid[y-1][x], 'down'))
-    if y < y_size - 1:      neighbors.append((grid[y+1][x], 'up'))
-    return neighbors
+    x, y, res = cell.x, cell.y, []
+    if x + 1 < x_size: res.append(('right', grid[y][x + 1]))
+    if x - 1 >= 0:     res.append(('left',  grid[y][x - 1]))
+    if y + 1 < y_size: res.append(('up',    grid[y + 1][x]))
+    if y - 1 >= 0:     res.append(('down',  grid[y - 1][x]))
+    return res
+
 
 def propagate(grid, start_cell, x_size, y_size):
+    """Returns False on contradiction (a neighbour left with 0 options)."""
     queue = deque([start_cell])
-
-    while  queue:
-        cell = queue.popleft()    #it's a better way of doing pop(0)
-        
-        for neighbor, direction in get_neighbors(grid, cell, x_size, y_size):
-            if neighbor. collapsed:   
-                continue                #if a neighbor is collapsed we skip it
-            
-            my_dir_idx = DIR_INDEX[direction]
-            opp_dir_idx = DIR_INDEX[OPPOSITE[direction]]
-
-            #این سلول در این سمت چه نوع سوکت‌هایی قبول می‌کنه؟
-            #از بین گزینه‌های سلول فعلی، همه سوکت‌هایی که در این جهت دارن رو جمع می‌کنیم.
-            valid_sockets = set(
-                all_tiles[opt].sockets[my_dir_idx] for opt in cell.options
-            )
-            #«همسایه فقط می‌تونه کاشی‌هایی باشه که بهم وصل می‌شن.»
+    in_queue = {(start_cell.x, start_cell.y)}
+    while queue:
+        cell = queue.popleft()
+        in_queue.discard((cell.x, cell.y))
+        for direction, neighbor in get_neighbors(grid, cell, x_size, y_size):
+            if neighbor.collapsed:
+                continue
+            dir_idx = DIR_INDEX[direction]
+            opp_idx = DIR_INDEX[OPPOSITE[direction]]
+            valid = {all_tiles[o].sockets[dir_idx] for o in cell.options}
             new_options = [
                 opt for opt in neighbor.options
-                if all_tiles[opt].sockets[opp_dir_idx] in valid_sockets
+                if any(check_match(all_tiles[opt].sockets[opp_idx], v)
+                       for v in valid)
             ]
-
             if len(new_options) < len(neighbor.options):
                 neighbor.options = new_options
-                if len(new_options) == 0:
-                    print(f"Contradiction at neighbor X: {neighbor.x}, Y: {neighbor.y}")
-                    print(f"Direction from cell ({cell.x}, {cell.y}) to neighbor: {direction}")
-                    print(f"Valid sockets required by cell: {valid_sockets}")
+                if not new_options:
+                    if DEBUG:
+                        print("Contradiction at (%d,%d) via %s"
+                              % (neighbor.x, neighbor.y, direction))
                     return False
-                queue.append(neighbor)
-                
+                key = (neighbor.x, neighbor.y)
+                if key not in in_queue:
+                    queue.append(neighbor)
+                    in_queue.add(key)
     return True
 
-#Main Loop_________________________________________________________
-max_attempts = 50
 
-def build_fresh_grid(x_size, y_size):
-    grid = []
-    for y in range(y_size):
-        row = []
-        for x in range(x_size):
-            row.append(Cell(x, y))
-        grid.append(row)
-    return grid
+# --------------------------- backtracking solver --------------------------
+def advance(grid, stack, x_size, y_size):
+    """
+    Restore to the latest decision frame that still has untried options,
+    apply the next option and propagate. Pops exhausted frames.
+    Returns True if a viable continuation is set up, False if exhausted.
+    """
+    while stack:
+        frame = stack[-1]
+        restore(grid, frame['snap'])
+        if not frame['remaining']:
+            stack.pop()
+            continue
+        chosen = frame['remaining'].pop(0)
+        cell = grid[frame['y']][frame['x']]
+        collapse_to(cell, chosen)
+        if propagate(grid, cell, x_size, y_size):
+            return True
+        # this option failed too -> loop tries next / pops
+    return False
 
-final_grid = None
 
-for attempt in range(max_attempts):
-    grid = build_fresh_grid(x_size, y_size)
-    contradiction = False
-    max_iterations = x_size * y_size
-    iterations = 0
+def solve(x_size, y_size, max_steps=200000):
+    grid = build_grid(x_size, y_size)
+    stack = []
+    steps = 0
+    while True:
+        steps += 1
+        if steps > max_steps:
+            if DEBUG:
+                print("Aborted: step cap reached.")
+            return grid, False
 
-    while iterations < max_iterations:
-        target = get_min_entropy_cell(grid, x_size, y_size)
-        if target is None:
-            break
+        cell = lowest_entropy_cell(grid)
+        if cell is None:
+            if is_fully_collapsed(grid):
+                return grid, True
+            # a 0-option cell exists -> backtrack
+            if not advance(grid, stack, x_size, y_size):
+                return grid, False
+            continue
 
-        success = collapse(target)
-        if not success:
-            print(f"[Attempt {attempt+1}] Collapse failed at ({target.x},{target.y})")
-            contradiction = True
-            break
+        # open a fresh decision frame and let advance() try it
+        stack.append({'snap': snapshot(grid), 'x': cell.x, 'y': cell.y,
+                      'remaining': weighted_order(cell.options)})
+        if not advance(grid, stack, x_size, y_size):
+            return grid, False
 
-        chosen_tile_id = target.options[0]
-        print(f"[Attempt {attempt+1}] Collapsed ({target.x},{target.y}) → Tile {chosen_tile_id}")
 
-        prop_success = propagate(grid, target, x_size, y_size)
-        if not prop_success:
-            print(f"[Attempt {attempt+1}] Contradiction in propagate!")
-            contradiction = True
-            break
+# --------------------------------- run ------------------------------------
+final_grid, ok = solve(x_size, y_size)
+if DEBUG:
+    print("Solved." if ok else "Failed - returning best-effort grid.")
 
-        iterations += 1
-
-    if not contradiction:
-        final_grid = grid
-        print(f"✓ Solved in attempt {attempt+1}")
-        break
-    else:
-        print(f"✗ Attempt {attempt+1} failed — retrying...")
-
-if final_grid is None:
-    print("!!! Could not solve after", max_attempts, "attempts.")
-    final_grid = grid
-
-#Drawing 2D grid___________________________________________________
-rectangles = []
-entropy_text = []
-dot_centers = []
-title_ids_text = []
-
-for y in range(y_size):
-    for x in range(x_size):
-        cell = final_grid[y][x]
-        origin = rg.Point3d(x, y, 0)
+rectangles, dot_centers, entropy_text, tile_ids_text = [], [], [], []
+for row in final_grid:
+    for cell in row:
+        origin = rg.Point3d(cell.x, cell.y, 0)
+        plane = rg.Plane(origin, rg.Vector3d.ZAxis)
+        rectangles.append(rg.Rectangle3d(plane, 1.0, 1.0))
         dot_centers.append(origin + rg.Vector3d(0.5, 0.5, 0))
-        rectangles.append(rg.Rectangle3d(rg.Plane(origin, rg.Vector3d.ZAxis), 1.0, 1.0))
-        entropy_text.append(str(cell.entropy()))
+        entropy_text.append(str(len(cell.options)))
+        tile_ids_text.append(str(cell.options[0]) if cell.collapsed else "_")
 
-        if cell.collapsed:
-            title_ids_text.append(str(cell.options[0]))
-        else:
-            title_ids_text.append("_")
-
-#output___________________________________________________
 cells = rectangles
 entropy = entropy_text
-dot_centers = dot_centers
-tile_ids = title_ids_text
+tile_ids = tile_ids_text
 
-#debug____________________________________________________
-collapsed_count = sum(1 for row in grid for cell in row if cell.collapsed)
-one_option_count = sum(1 for row in grid for cell in row if len(cell.options) == 1)
-zero_option_count = sum(1 for row in grid for cell in row if len(cell.options) == 0)
-
-print(f"Collapsed: {collapsed_count}")
-print(f"One option (not collapsed): {one_option_count}")
-print(f"Zero options (contradiction): {zero_option_count}")
+if DEBUG:
+    collapsed_count = sum(1 for r in final_grid for c in r if c.collapsed)
+    one_option = sum(1 for r in final_grid for c in r if len(c.options) == 1)
+    zero_option = sum(1 for r in final_grid for c in r if len(c.options) == 0)
+    print("collapsed:", collapsed_count,
+          "| one:", one_option, "| zero:", zero_option)
